@@ -55,6 +55,15 @@ python vllm_test.py \
 
 ### 进阶示例
 
+quick start
+```
+python vllm_test.py \
+    --model-path /home/rx/models/DeepSeek-R1-Distill-Llama-70B \
+    --model-name DeepSeek-R1-Distill-Llama-70B \
+    --test-iterations 5 \
+    --cooldown-time 30
+```
+
 以下是一个使用自定义参数进行测试的示例：
 
 ```bash

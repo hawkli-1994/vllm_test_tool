@@ -10,6 +10,8 @@ from typing import Optional
 import psutil
 import logging
 from datetime import datetime
+import requests
+from requests.exceptions import RequestException
 
 # Configure logging
 logging.basicConfig(
@@ -31,7 +33,8 @@ class VLLMTester:
         max_num_seqs: int = 512,
         test_iterations: int = 5,
         cooldown_time: int = 30,
-        log_dir: str = "logs"
+        log_dir: str = "logs",
+        startup_timeout: int = 1800  # 30分钟超时
     ):
         self.model_path = os.path.dirname(model_path)  # 获取模型的父目录
         self.model_name = model_name
@@ -45,6 +48,8 @@ class VLLMTester:
         self.cooldown_time = cooldown_time
         self.container_id: Optional[str] = None
         self.log_dir = log_dir
+        self.startup_timeout = startup_timeout
+        self.log_file: Optional[str] = None
         
         # 创建日志目录
         if not os.path.exists(self.log_dir):
@@ -78,20 +83,16 @@ class VLLMTester:
             "--enable-prefix-caching"
         ]
 
-    def _collect_container_logs(self, iteration: int):
-        """收集容器日志"""
-        if not self.container_id:
+    def _update_container_logs(self):
+        """更新容器日志"""
+        if not self.container_id or not self.log_file:
             return
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(self.log_dir, f"container_logs_iter{iteration}_{timestamp}.log")
         
         try:
             # 获取容器日志
             log_cmd = ["docker", "logs", self.container_id]
-            with open(log_file, 'w') as f:
+            with open(self.log_file, 'w') as f:
                 subprocess.run(log_cmd, stdout=f, stderr=subprocess.STDOUT, check=True)
-            logger.info(f"Container logs saved to {log_file}")
         except subprocess.CalledProcessError as e:
             logger.error(f"Error collecting container logs: {e}")
 
@@ -99,26 +100,64 @@ class VLLMTester:
         """停止并删除Docker容器"""
         if self.container_id:
             try:
+                # 最后一次更新日志
+                self._update_container_logs()
                 subprocess.run(["docker", "stop", self.container_id], check=True)
                 subprocess.run(["docker", "rm", self.container_id], check=True)
                 logger.info(f"Container {self.container_id} stopped and removed")
             except subprocess.CalledProcessError as e:
                 logger.error(f"Error stopping container: {e}")
             self.container_id = None
+            self.log_file = None
 
-    def _wait_for_service(self, timeout: int = 30) -> bool:
-        """等待服务启动，带超时检查"""
+    def _check_container_running(self) -> bool:
+        """检查容器是否还在运行"""
+        if not self.container_id:
+            return False
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Running}}", self.container_id],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            return result.stdout.strip().lower() == "true"
+        except subprocess.CalledProcessError:
+            return False
+
+    def _wait_for_service(self, timeout: int) -> bool:
+        """等待服务启动，使用metrics接口进行健康检查"""
         start_time = time.time()
+        metrics_url = f"http://localhost:{self.port}/metrics"
+        models_url = f"http://localhost:{self.port}/v1/models"
+        
         while time.time() - start_time < timeout:
+            if not self._check_container_running():
+                logger.error("Container stopped unexpectedly")
+                return False
+
             try:
-                health_check_cmd = f"curl -s http://localhost:{self.port}/v1/models"
-                result = subprocess.run(health_check_cmd, shell=True, capture_output=True)
-                if result.returncode == 0:
-                    logger.info("Service is running successfully")
-                    return True
-                time.sleep(5)
-            except subprocess.CalledProcessError:
-                time.sleep(5)
+                # 首先检查metrics接口
+                metrics_response = requests.get(metrics_url, timeout=5)
+                if metrics_response.status_code == 200:
+                    # 然后检查models接口
+                    models_response = requests.get(models_url, timeout=5)
+                    if models_response.status_code == 200:
+                        logger.info("Service is fully operational")
+                        return True
+                    
+            except RequestException as e:
+                logger.debug(f"Service not ready yet: {str(e)}")
+            
+            # 每30秒更新一次日志
+            if int(time.time() - start_time) % 30 == 0:
+                self._update_container_logs()
+            
+            # 每5秒检查一次服务状态
+            time.sleep(5)
+            logger.info(f"Waiting for service to start... ({int(time.time() - start_time)}s/{timeout}s)")
+
+        logger.error(f"Service failed to start within {timeout} seconds")
         return False
 
     def run_test(self):
@@ -138,23 +177,25 @@ class VLLMTester:
                     logger.error("Failed to start Docker container")
                     continue
 
+                # 创建日志文件
+                timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                self.log_file = os.path.join(self.log_dir, f"{self.container_id[:12]}-{timestamp}.log")
                 logger.info(f"Container started with ID: {self.container_id}")
+                logger.info(f"Container logs will be saved to: {self.log_file}")
 
                 # 等待服务启动并检查健康状态
-                if not self._wait_for_service(timeout=60):
-                    logger.error("Service failed to start within timeout")
-                    self._collect_container_logs(iteration)
-                else:
-                    logger.info("Service health check passed")
+                if not self._wait_for_service(timeout=self.startup_timeout):
+                    logger.error("Service failed to start properly")
+                    self._stop_container()
+                    continue
 
-                # 运行一段时间
+                logger.info("Service is running successfully")
+
+                # 运行指定时间
                 logger.info(f"Running for {self.cooldown_time} seconds...")
                 time.sleep(self.cooldown_time)
 
-                # 收集容器日志
-                self._collect_container_logs(iteration)
-
-                # 停止容器
+                # 停止容器（包含最后的日志更新）
                 self._stop_container()
 
                 # 冷却时间
@@ -164,11 +205,9 @@ class VLLMTester:
 
         except KeyboardInterrupt:
             logger.info("\nTest interrupted by user")
-            self._collect_container_logs(iteration)
             self._stop_container()
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
-            self._collect_container_logs(iteration)
             self._stop_container()
 
 def main():
@@ -184,6 +223,7 @@ def main():
     parser.add_argument('--test-iterations', type=int, default=5, help='Number of test iterations')
     parser.add_argument('--cooldown-time', type=int, default=30, help='Cooldown time between iterations (seconds)')
     parser.add_argument('--log-dir', default='logs', help='Directory to store container logs')
+    parser.add_argument('--startup-timeout', type=int, default=1800, help='Timeout for service startup in seconds (default: 30 minutes)')
 
     args = parser.parse_args()
 
@@ -198,7 +238,8 @@ def main():
         max_num_seqs=args.max_num_seqs,
         test_iterations=args.test_iterations,
         cooldown_time=args.cooldown_time,
-        log_dir=args.log_dir
+        log_dir=args.log_dir,
+        startup_timeout=args.startup_timeout
     )
 
     tester.run_test()
